@@ -390,17 +390,16 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
-    int end_index = BLOCK_DIM - 1;
-    int num_circles = cuConstRendererParams.numCircles;
+    int pixel_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixel_y = blockIdx.y * blockDim.y + threadIdx.y;;
+
 
     int image_width = cuConstRendererParams.imageWidth;
     int image_height = cuConstRendererParams.imageHeight;
     float inv_width = 1.f / image_width;
     float inv_height = 1.f / image_height;
+    int num_circles = cuConstRendererParams.numCircles;
 
-    int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
-    int pixel_x = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixel_y = blockIdx.y * blockDim.y + threadIdx.y;;
     // if the pixel is outside the image, then return
     if (pixel_x >= image_width || pixel_y >= image_height) return;
 
@@ -409,69 +408,111 @@ __global__ void kernelRenderCircles() {
         inv_width * (static_cast<float>(pixel_x) + 0.5f),
         inv_height * (static_cast<float>(pixel_y) + 0.5f)
         );
+
+    int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+
         
     // Make a rectangle bounding box around the pixel position.
-    float left_bound = blockIdx.x * blockDim.x;
-    float right_bound = (blockIdx.x + 1) * blockDim.x + 1.f;
-    float lower_bound = blockIdx.y * blockDim.y;
-    float upper_bound =  (blockIdx.y + 1) * blockDim.y + 1.f;
+    float left = blockIdx.x * blockDim.x;
+    float right = ((blockIdx.x + 1) * blockDim.x + 1 > image_width) ? (blockIdx.x + 1) * blockDim.x + 1 : image_width;
+    float bottom = blockIdx.y * blockDim.y;
+    float top =  ((blockIdx.y + 1) * blockDim.y + 1 > image_width) ? (blockIdx.x + 1) * blockDim.y + 1: image_height;
 
-    float l_b = (left_bound * inv_width < 1.f) ? left_bound * inv_width : 1.f;
-    float r_b = (right_bound * inv_width < 1.f) ? right_bound * inv_width : 1.f;
-    float lo_b = (lower_bound * inv_height < 1.f) ? lower_bound * inv_height : 1.f;
-    float u_b = (upper_bound * inv_height < 1.f) ? upper_bound * inv_height : 1.f;
+    left = inv_width * left;
+    right = inv_width * right;
+    bottom = inv_height * bottom;
+    top = inv_height * top;
 
     struct CircleInformation{
         int circle_index;
         float3 circle_point;
-        bool draw_this;
     };
 
     __shared__ uint prefix_sum_input[BLOCK_DIM];
     __shared__ uint prefix_sum_output[BLOCK_DIM];
     __shared__ uint prefix_sum_scratch[2 * BLOCK_DIM];
     __shared__ CircleInformation circles_to_draw[BLOCK_DIM];
+    __shared__ int counter;
 
     float3 p;
-    float rad;
+
+    if (thread_id == 0) {
+        counter = 0;
+    }
+    __syncthreads();
 
     // iterate over blocks!
     for (int i = 0; i < num_circles; i += BLOCK_DIM) {
         bool draw_this = false;
 
-
         int circle_index = i + thread_id;
+        prefix_sum_input[thread_id] = 0;
+
         // if the circle for this thread does not exist then
         if (circle_index < num_circles){
             // read position and radius
             p = *(float3*)(&cuConstRendererParams.position[3 * circle_index]);
-            rad = cuConstRendererParams.radius[circle_index];
-            prefix_sum_input[thread_id] = circleInBoxConservative(p.x, p.y, rad, l_b, r_b, u_b, lo_b);
-        }
-        else {
-            p = *(float3*)(&cuConstRendererParams.position[0]);
-            prefix_sum_input[thread_id] = 0;
+            float rad = cuConstRendererParams.radius[circle_index + 1];
+
+            prefix_sum_input[thread_id] = circleInBoxConservative(p.x, p.y, rad, left, right, top, bottom);
+
+            draw_this = true;
         }
 
         __syncthreads(); 
 
         sharedMemExclusiveScan(thread_id, prefix_sum_input, prefix_sum_output, prefix_sum_scratch, BLOCK_DIM);
+
+        /*
+        1 0 1       - input
+        1 1 2       - this circle
+
+        0 0 1       - input
+        0 0 1       - this circle
+
+        1 0 1       - input
+        1 1 2       - this circle
+
+        0 1 1       - input
+        0 1 2       - this circle
+
+        k k k 
+        1 1 2
+
+        circles to draw:
+        c c 0 ....
+       */
+
+
+        // if (thread_id == 0) {
+        //     continue;
+        // }
+
+        int this_circle = prefix_sum_output[thread_id];
         
         __syncthreads(); 
 
-        draw_this = ((thread_id == 0 && prefix_sum_input > 0) || prefix_sum_output[thread_id] > prefix_sum_output [thread_id - 1]) ? true : false;
+        if (thread_id > 0) {
+            int last_index = prefix_sum_output[thread_id - 1];
+            int this_index = prefix_sum_output[thread_id];
 
-        int  j = prefix_sum_output[thread_id];
-        struct CircleInformation circle_in_question = {circle_index, p, draw_this};
-        circles_to_draw[j] = circle_in_question;
+            // Only draw if different
+            if (last_index == this_index) {
+                draw_this = false;
+            }
+        }
+
         
-    
+        if (draw_this) {
+            struct CircleInformation circle_in_question = {circle_index, p};
+            circles_to_draw[this_circle] = circle_in_question;
+            atomicAdd(&counter, 1);
+        }
+
         __syncthreads();
 
-        for (int circle = 0; circle <= 3; circle++) {
-            if (circles_to_draw[circle].draw_this) {
-                shadePixel(circles_to_draw[circle].circle_index, pixel_center_norm, circles_to_draw[circle].circle_point, img_ptr);
-            }
+        for (int circle = 0; circle < counter; circle++) {
+            shadePixel(circles_to_draw[circle].circle_index, pixel_center_norm, circles_to_draw[circle].circle_point, img_ptr);
         }
 
         __syncthreads(); 
@@ -688,7 +729,7 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    dim3 blockDim(16, BLOCK_DIM / 16);
+    dim3 blockDim(16, 16);
     // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
