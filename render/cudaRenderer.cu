@@ -433,10 +433,6 @@ __global__ void kernelRenderCircles() {
     int counter;
     int adjuster;
 
-    if (thread_id == 0) {
-        counter = 0;
-    }
-
     for (int i = 0; i < num_circles; i += BLOCK_DIM) {
 
         circle_index = i + thread_id;
