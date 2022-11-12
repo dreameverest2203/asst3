@@ -14,6 +14,12 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define SCAN_BLOCK_DIM 512
+#define BLOCK_DIM 512
+
+#include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -698,14 +704,9 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // // 256 threads per block is a healthy number
-    // dim3 blockDim(256, 1);
+    dim3 blockDim(16, 32, 1);
     // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
-    // kernelRenderCircles<<<gridDim, blockDim>>>();
-    // cudaDeviceSynchronize();
-    dim3 blockDim(16,16);
-    dim3 gridDim((image->width+blockDim.x-1)/blockDim.x,(image->height+blockDim.y-1)/blockDim.y);
-    kernelRenderCircles_2<<<gridDim, blockDim>>>();
-    return;
+    dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
+    kernelRenderCircles<<<gridDim, blockDim>>>();
+    cudaDeviceSynchronize();
 }
